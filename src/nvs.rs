@@ -1,3 +1,4 @@
+use core::ffi::FromBytesWithNulError;
 use core::ptr;
 
 extern crate alloc;
@@ -19,6 +20,17 @@ static NONDEFAULT_LOCKED: mutex::Mutex<alloc::collections::BTreeSet<CString>> =
 
 pub type EspDefaultNvsPartition = EspNvsPartition<NvsDefault>;
 pub type EspCustomNvsPartition = EspNvsPartition<NvsCustom>;
+
+/// Error type to describe errors expected when accessing NVS string.
+#[derive(Debug)]
+pub enum NvsStringAccessError {
+    /// Native ESP function error.
+    Esp(EspError),
+    /// Null terminated string decode error.
+    FromBytesWithNul(FromBytesWithNulError),
+    /// UTF8 string decode error.
+    Utf8(core::str::Utf8Error),
+}
 
 pub trait NvsPartitionId {
     fn is_default(&self) -> bool {
@@ -257,6 +269,86 @@ impl<T: NvsPartitionId> EspNvs<T> {
                 let len: u8 = (value & 0xff) as u8;
 
                 Ok(Some(len as _))
+            }
+        }
+    }
+
+    /// Gets NVS string as raw byte array.
+    pub fn get_str_raw<'a>(&self, name: &str, buf: &'a mut [u8]) -> Result<Option<&'a [u8]>, EspError> {
+        let c_key = CString::new(name).unwrap();
+        // check for blob value, by getting blob length
+        let mut len = 0;
+        match unsafe {
+            nvs_get_str(self.1, c_key.as_ptr(), ptr::null_mut(), &mut len as *mut _)
+        } {
+            ESP_ERR_NVS_NOT_FOUND => Ok(None),
+            err => {
+                // bail on error
+                esp!(err)?;
+
+                len = buf.len();
+
+                // fetch value if no error
+                esp!(unsafe {
+                    nvs_get_str(
+                        self.1,
+                        c_key.as_ptr(),
+                        buf.as_mut_ptr() as *mut _,
+                        &mut len as *mut _,
+                    )
+                })?;
+
+                Ok(Some(&buf[..len]))
+            }
+        }
+    }
+
+    /// Gets NVS string as str.
+    pub fn get_str<'a>(&self, name: &str, buf: &'a mut [u8]) -> Result<Option<&'a str>, NvsStringAccessError> {
+        let result = self.get_str_raw(name, buf);
+        match result {
+            Ok(o) => {
+                if let Some(s) = o {
+                    match CStr::from_bytes_with_nul(s) {
+                        Ok(s) => match s.to_str() {
+                            Ok(s) => Ok(Some(s)),
+                            Err(e) => Err(NvsStringAccessError::Utf8(e)),
+                        },
+                        Err(e) => Err(NvsStringAccessError::FromBytesWithNul(e)),
+                    }
+                } else {
+                    Ok(None)
+                }
+            },
+            Err(e) => Err(NvsStringAccessError::Esp(e)),
+        }
+    }
+
+    pub fn get_blob<'a>(&self, name: &str, buf: &'a mut [u8]) -> Result<Option<&'a [u8]>, EspError> {
+        let c_key = CString::new(name).unwrap();
+        // check for blob value, by getting blob length
+        let mut len = 0;
+        match unsafe {
+            nvs_get_blob(self.1, c_key.as_ptr(), ptr::null_mut(), &mut len as *mut _)
+        } {
+            ESP_ERR_NVS_NOT_FOUND => Ok(None),
+            err => {
+                // bail on error
+                esp!(err)?;
+
+                len = buf.len();
+
+                // fetch value if no error
+                esp!(unsafe {
+                    nvs_get_blob(
+                        self.1,
+                        c_key.as_ptr(),
+                        buf.as_mut_ptr() as *mut _,
+                        &mut len as *mut _,
+                    )
+                })?;
+
+                Ok(Some(&buf[..len]))
             }
         }
     }
